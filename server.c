@@ -274,14 +274,15 @@ static bool handle_ready(request *req, const char *line) {
     }
     if(parse_account_command(line,"read",&index)){
         if(record_owner[index]!=-1){
-            snprintf(response,sizeof(response),"Locked\n%s",ready_prompt);
+            snprintf(response,sizeof(response),
+                ">>> Locked.\n%s",ready_prompt);
             return send_text(req->conn_fd,response) == 0;
         }
         int result = set_record_lock(index,F_RDLCK);
         if(result<0){
             if(errno==EAGAIN||errno==EACCES){
                 snprintf(response,sizeof(response),
-                    "Locked\n%s",ready_prompt);
+                    ">>> Locked.\n%s",ready_prompt);
                 return send_text(req->conn_fd,response) == 0;
             }
             else return false;
@@ -299,14 +300,15 @@ static bool handle_ready(request *req, const char *line) {
         return send_text(req->conn_fd,response) == 0;
     }else if(parse_account_command(line,"update",&index)){
         if(record_owner[index]!=-1){
-            snprintf(response,sizeof(response),"Locked\n%s",ready_prompt);
+            snprintf(response,sizeof(response),
+                ">>> Locked.\n%s",ready_prompt);
             return send_text(req->conn_fd,response) == 0;
         }
-        int result = set_record_lock(index,F_RDLCK);
+        int result = set_record_lock(index,F_WRLCK);
         if(result<0){
             if(errno==EAGAIN||errno==EACCES){
                 snprintf(response,sizeof(response),
-                    "Locked\n%s",ready_prompt);
+                    ">>> Locked\n%s",ready_prompt);
                 return send_text(req->conn_fd,response) == 0;
             }
             else return false;
@@ -314,6 +316,7 @@ static bool handle_ready(request *req, const char *line) {
         record_owner[index] = req->conn_fd;
         if(read_record_at(index,&record)<0){
             set_record_lock(index,F_UNLCK); 
+            record_owner[index] = -1;
             return false;
         }
         req->state = WAIT_UPDATE;

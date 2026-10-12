@@ -107,18 +107,24 @@ int pop_command(request *req, char *out, size_t out_size) {
 }
 
 static int set_record_lock(int index, short type) {
+    struct flock lock;
+    lock.l_type = type;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = (off_t)index*sizeof(account_record);
+    lock.l_len = sizeof(account_record);
+    return fcntl(record_fd,F_SETLK,&lock);
     /*
      * TODO 2: Apply type to exactly one record using fcntl(F_SETLK).
      * Return the syscall result and preserve errno on failure.
      * The success stub is only for developing Task 1.
      */
-    (void)index;
-    (void)type;
     return 0;
 }
 
 static void release_update(request *req) {
     if (req->state != WAIT_UPDATE) return;
+    set_record_lock(req->account_index,F_UNLCK);
+    record_owner[req->account_index] = -1;
     /* TODO 2: Release this request's update lock and matching local owner. */
 
     /*
@@ -263,18 +269,28 @@ static bool handle_ready(request *req, const char *line) {
     if(strcmp("exit",line)==0){
         snprintf(response,sizeof(response),
             ">>> Client exit.\n");
-        send_text(req->conn_fd,response) == 0;
+        send_text(req->conn_fd,response);
         return false;
     }
     if(parse_account_command(line,"read",&index)){
+        if(record_owner[index]!=-1||set_record_lock(index,F_RDLCK)<0){
+            snprintf(response,sizeof(response),"Locked\n");
+            return send_text(req->conn_fd,response) == 0;
+        }
         if(read_record_at(index,&record)<0) return false;
         snprintf(response,sizeof(response),
             ">>> Account %d balance: %d\n%s",
             record.id,
             record.balance,
             ready_prompt);
+        if(set_record_lock(index,F_UNLCK)<0) return false;
         return send_text(req->conn_fd,response) == 0;
     }else if(parse_account_command(line,"update",&index)){
+        if(record_owner[index]!=-1||set_record_lock(index,F_WRLCK)<0){
+            snprintf(response,sizeof(response),"Locked\n");
+            return send_text(req->conn_fd,response) == 0;
+        }
+        record_owner[index] = req->conn_fd;
         if(read_record_at(index,&record)<0) return false;
         req->state = WAIT_UPDATE;
         req->account_index = index;
@@ -289,7 +305,7 @@ static bool handle_ready(request *req, const char *line) {
     }else{
         snprintf(response,sizeof(response),
             ">>> [Error] Invalid command.\n");
-        send_text(req->conn_fd,response) == 0;
+        send_text(req->conn_fd,response);
         return false;
     }
     /* TODO 1: read <id>, update <id>, exit. Invalid input closes the client.
@@ -318,7 +334,7 @@ static bool handle_wait_update(request *req, const char *line) {
         release_update(req);
         snprintf(response,sizeof(response),
             ">>> Client exit.\n");
-        send_text(req->conn_fd,response) == 0;
+        send_text(req->conn_fd,response);
         return false;
     }
     int dt;
@@ -343,7 +359,7 @@ static bool handle_wait_update(request *req, const char *line) {
     }else{
         snprintf(response,sizeof(response),
             ">>> [Error] Invalid command.\n");
-        send_text(req->conn_fd,response) == 0;
+        send_text(req->conn_fd,response);
         return false;
     }
     /* TODO 1: add <delta>, close, exit.

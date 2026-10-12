@@ -44,9 +44,18 @@ static int send_text(int fd, const char *text) {
      *
      * This is also used for the welcome message, so complete it first.
      */
-    (void)fd;
-    (void)text;
-    return -1;
+    size_t total = 0;
+    size_t len = strlen(text);
+    while(total<len){
+	ssize_t n = write(fd,text+total,len-total);
+	if(n<0){
+	    if(errno == EINTR)continue;
+	    return -1;
+	}
+	if(n==0) return -1;
+	total += (size_t)n;
+    }
+    return 0;
 }
 
 static void init_request(request *req) {
@@ -116,7 +125,10 @@ static void release_update(request *req) {
      * TODO 1: Reset the update-related fields to their READY values.
      * Preserve the connection and input buffer. Repeated cleanup must be safe.
      */
-    (void)req;
+    req->state = READY;
+    req->account_index = -1;
+    req->current_balance = 0;
+    return;
 }
 
 static void close_client(int fd, fd_set *master) {
@@ -245,6 +257,41 @@ static int write_record_at(int index, const account_record *record) {
 
 /* A handler returns true to keep the connection, false to close it. */
 static bool handle_ready(request *req, const char *line) {
+    int index;
+    char response[MAX_MSG_LEN];
+    account_record record;
+    if(strcmp("exit",line)==0){
+        snprintf(response,sizeof(response),
+            ">>> Client exit.\n");
+        send_text(req->conn_fd,response) == 0;
+        return false;
+    }
+    if(parse_account_command(line,"read",&index)){
+        if(read_record_at(index,&record)<0) return false;
+        snprintf(response,sizeof(response),
+            ">>> Account %d balance: %d\n%s",
+            record.id,
+            record.balance,
+            ready_prompt);
+        return send_text(req->conn_fd,response) == 0;
+    }else if(parse_account_command(line,"update",&index)){
+        if(read_record_at(index,&record)<0) return false;
+        req->state = WAIT_UPDATE;
+        req->account_index = index;
+        req->current_balance = record.balance;
+        snprintf(response,sizeof(response),
+            ">>> Account %d balance: %d\n"
+            ">>> Update lock acquired.\n%s",
+            record.id,
+            record.balance,
+            update_prompt);
+        return send_text(req->conn_fd,response) == 0;
+    }else{
+        snprintf(response,sizeof(response),
+            ">>> [Error] Invalid command.\n");
+        send_text(req->conn_fd,response) == 0;
+        return false;
+    }
     /* TODO 1: read <id>, update <id>, exit. Invalid input closes the client.
      * TODO 2: read takes a short shared lock; update retains a write lock.
      * Check local ownership too. A lock conflict immediately replies Locked.
@@ -258,6 +305,47 @@ static bool handle_ready(request *req, const char *line) {
 }
 
 static bool handle_wait_update(request *req, const char *line) {
+    int index = req->account_index;
+    char response[MAX_MSG_LEN];
+    account_record record;
+    if(strcmp(line,"close")==0){
+        release_update(req);
+        snprintf(response,sizeof(response),
+        ">>> Update closed.\n%s",
+        ready_prompt);
+        return send_text(req->conn_fd,response) == 0;
+    }else if(strcmp(line,"exit")==0){
+        release_update(req);
+        snprintf(response,sizeof(response),
+            ">>> Client exit.\n");
+        send_text(req->conn_fd,response) == 0;
+        return false;
+    }
+    int dt;
+    if(parse_delta_command(line, &dt)==true){
+        if(read_record_at(index,&record)<0) return false;
+        if(record.balance+dt<0||record.balance+dt>1000000){
+            snprintf(response,sizeof(response),
+            ">>> [Error] Balance out of range.\n%s",
+            update_prompt);
+            return send_text(req->conn_fd,response) == 0;
+        }
+        record.balance += dt;
+        if(write_record_at(index,&record)<0) return false;
+        req->current_balance = record.balance;
+        snprintf(response,sizeof(response),
+            ">>> Update successful.\n"
+            ">>> Account %d balance: %d\n%s",
+            record.id,
+            record.balance,
+            update_prompt);
+        return send_text(req->conn_fd,response) == 0;
+    }else{
+        snprintf(response,sizeof(response),
+            ">>> [Error] Invalid command.\n");
+        send_text(req->conn_fd,response) == 0;
+        return false;
+    }
     /* TODO 1: add <delta>, close, exit.
      * Each valid add writes immediately and updates current_balance; remain
      * in WAIT_UPDATE, retaining the lock. A range error also stays here.

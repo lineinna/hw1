@@ -321,7 +321,7 @@ static bool handle_ready(request *req, const char *line) {
         }
         req->state = WAIT_UPDATE;
         req->account_index = index;
-//      req->current_balance = record.balance;
+        req->current_balance = record.balance;
         snprintf(response,sizeof(response),
             ">>> Account %d balance: %d\n"
             ">>> Update lock acquired.\n%s",
@@ -368,7 +368,7 @@ static bool handle_wait_update(request *req, const char *line) {
     if(parse_delta_command(line, &dt)==true){
         if(read_record_at(index,&record)<0) return false;
         if((long long)record.balance+(long long)dt<0
-            ||(long long)record.balance+(long long)dt>1000000){
+            ||(long long)record.balance+(long long)dt>MAX_BALANCE){
             snprintf(response,sizeof(response),
             ">>> [Error] Balance out of range.\n%s",
             update_prompt);
@@ -425,44 +425,70 @@ static bool handle_transfer_ready(request *req, const char *line) {
     if(parse_account_command(line,"receive",&index)){
         if(receiver_fd[index]!=-1){
             snprintf(response,sizeof(response),
-            ">>> [Error] Receiver already registered.\n%s"
+            ">>> [Error] Receiver already registered.\n%s",
                 ready_prompt);
             return send_text(req->conn_fd,response) == 0;
         }
         receiver_fd[index]  = req->conn_fd;
         req->state = WAIT_RECEIVE;
         req->account_index = index;
-        req->current_balance = record.balance;
+//        req->current_balance = record.balance;
         snprintf(response,sizeof(response),
             ">>> Ready to receive on account %d.\n%s",
             index+ACCOUNT_ID_START,
             receive_prompt);
-        return send_text(req->conn_fd,response) == 0;
+        if(send_text(req->conn_fd,response)<0){
+            receiver_fd[index]  = -1;
+            req->state = READY;
+            req->account_index = -1;
+            return false;
+        }
+        return true;
     }else if(parse_transfer_command(line,&src,&dst,&amount)==true){
         if(receiver_fd[dst] == -1){
             snprintf(response,sizeof(response),
-            ">>> [Error] Receiver unavailable.\n%s"
+            ">>> [Error] Receiver unavailable.\n%s",
                 ready_prompt);
             return send_text(req->conn_fd,response) == 0;
         }
         int dst_fd = receiver_fd[dst];
         int src_fd = req->conn_fd;
         if((record_owner[src]!=-1
-            &&record_owner[src]!=src_fd)
-            ||set_record_lock(src,F_WRLCK)<0){
+            &&record_owner[src]!=src_fd)){
             snprintf(response,sizeof(response),
                 ">>> Locked.\n%s", ready_prompt);
-            return send_text(req->conn_fd,response);
+            return send_text(req->conn_fd,response)==0;
+        }
+        int result = set_record_lock(src,F_WRLCK);
+        if(result<0){
+            if(errno==EAGAIN||errno==EACCES){
+                snprintf(response,sizeof(response),
+                    ">>> Locked.\n%s",ready_prompt);
+                return send_text(req->conn_fd,response) == 0;
+            }
+            else return false;
         }
         record_owner[src] = src_fd;
         if((record_owner[dst]!=-1
-            &&record_owner[dst]!=src_fd)
-            ||set_record_lock(dst,F_WRLCK)<0){
+            &&record_owner[dst]!=src_fd)){
             snprintf(response,sizeof(response),
                 ">>> Locked.\n%s", ready_prompt);
             record_owner[src] = -1;
-            if(set_record_lock(src,F_UNLCK)<0) return false;
-            return send_text(req->conn_fd,response);
+            set_record_lock(src,F_UNLCK);
+            return send_text(req->conn_fd,response)==0;
+        }
+        result = set_record_lock(dst,F_WRLCK);
+        if(result<0){
+            if(errno==EAGAIN||errno==EACCES){
+                record_owner[src] = -1;
+                snprintf(response,sizeof(response),
+                    ">>> Locked.\n%s",ready_prompt);  
+                set_record_lock(src,F_UNLCK);
+                return send_text(req->conn_fd,response)==0;
+            }
+            set_record_lock(src,F_UNLCK);
+            record_owner[src] = -1;
+            return false;
         }
         record_owner[dst] = src_fd;
         account_record src_record;
@@ -479,7 +505,7 @@ static bool handle_transfer_ready(request *req, const char *line) {
         newsrcbalance-=amount;
         long long newdstbalance = (long long)dst_record.balance;
         newdstbalance += amount;
-        if(newsrcbalance<0||newdstbalance>1000000){
+        if(newsrcbalance<0||newdstbalance>MAX_BALANCE){
             snprintf(response,sizeof(response),
                 ">>> [Error] Balance out of range.\n%s",
                 ready_prompt);
@@ -487,7 +513,7 @@ static bool handle_transfer_ready(request *req, const char *line) {
             record_owner[dst] = -1;
             set_record_lock(src,F_UNLCK);
             set_record_lock(dst,F_UNLCK);
-            return send_text(req->conn_fd,response);
+            return send_text(req->conn_fd,response)==0;
         }
         req->state = WAIT_TRANSFER_OUT;
         req->account_index = src;
@@ -495,7 +521,6 @@ static bool handle_transfer_ready(request *req, const char *line) {
         snprintf(response,sizeof(response),
             ">>> Transfer requested.\n%s",
             transfer_prompt);
-        if(send_text(req->conn_fd,response)<0)return false;
         req->state = WAIT_TRANSFER_OUT;
         req->account_index = src;
         req->target_index = dst;
@@ -505,10 +530,18 @@ static bool handle_transfer_ready(request *req, const char *line) {
         requestP[dst_fd].peer_fd = src_fd;
         int src_id = ACCOUNT_ID_START+src;
         int dst_id = ACCOUNT_ID_START+dst;
+        if(send_text(req->conn_fd,response)<0){
+            cleanup_transfer(req);
+            return false;
+        }
         snprintf(response, sizeof(response), 
             ">>> Transfer offer: %d -> %d, amount: %d\n%s", 
             src_id, dst_id, amount, accept_prompt);
-        return send_text(dst_fd,response) == 0;
+        if(send_text(dst_fd,response)<0){
+            cleanup_transfer(req);
+            return false;
+        }
+        return true;
     }else{
         snprintf(response,sizeof(response),
             ">>> [Error] Invalid command.\n");
@@ -530,6 +563,7 @@ static bool handle_transfer_ready(request *req, const char *line) {
 }
 
 static bool handle_wait_transfer(request *req, const char *line) {
+    char response[MAX_MSG_LEN];
     if(req->state == WAIT_RECEIVE){
         if(strcmp(line,"cancel")==0){
             receiver_fd[req->account_index]  = -1;

@@ -277,7 +277,7 @@ static bool handle_ready(request *req, const char *line) {
             snprintf(response,sizeof(response),"Locked\n%s",ready_prompt);
             return send_text(req->conn_fd,response) == 0;
         }
-        int reult = set_record_lock(index,F_RDLCK);
+        int result = set_record_lock(index,F_RDLCK);
         if(result<0){
             if(errno==EAGAIN||errno==EACCES){
                 snprintf(response,sizeof(response),
@@ -287,7 +287,7 @@ static bool handle_ready(request *req, const char *line) {
             else return false;
         }
         if(read_record_at(index,&record)<0){
-            set_record_lock(index,F_UNLCK)<0; 
+            set_record_lock(index,F_UNLCK); 
             return false;
         }
         snprintf(response,sizeof(response),
@@ -302,7 +302,7 @@ static bool handle_ready(request *req, const char *line) {
             snprintf(response,sizeof(response),"Locked\n%s",ready_prompt);
             return send_text(req->conn_fd,response) == 0;
         }
-        int reult = set_record_lock(index,F_RDLCK);
+        int result = set_record_lock(index,F_RDLCK);
         if(result<0){
             if(errno==EAGAIN||errno==EACCES){
                 snprintf(response,sizeof(response),
@@ -313,7 +313,7 @@ static bool handle_ready(request *req, const char *line) {
         }
         record_owner[index] = req->conn_fd;
         if(read_record_at(index,&record)<0){
-            set_record_lock(index,F_UNLCK)<0; 
+            set_record_lock(index,F_UNLCK); 
             return false;
         }
         req->state = WAIT_UPDATE;

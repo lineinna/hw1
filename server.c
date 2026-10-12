@@ -367,7 +367,8 @@ static bool handle_wait_update(request *req, const char *line) {
     int dt;
     if(parse_delta_command(line, &dt)==true){
         if(read_record_at(index,&record)<0) return false;
-        if(record.balance+dt<0||record.balance+dt>1000000){
+        if((long long)record.balance+(long long)dt<0
+            ||(long long)record.balance+(long long)dt>1000000){
             snprintf(response,sizeof(response),
             ">>> [Error] Balance out of range.\n%s",
             update_prompt);
@@ -418,6 +419,101 @@ static void cleanup_transfer(request *req) {
 }
 
 static bool handle_transfer_ready(request *req, const char *line) {
+    int index;
+    int src,dst,amount;
+    if(parse_account_command(line,"receive",&index)){
+        if(receiver_fd[index]!=-1){
+            snprintf(response,sizeof(response),
+            ">>> [Error] Receiver already registered.\n%s"
+                ready_prompt);
+            return send_text(req->conn_fd,response) == 0;
+        }
+        receiver_fd[index]  = req->conn_fd;
+        req->state = WAIT_RECEIVE;
+        req->account_index = index;
+        req->current_balance = record.balance;
+        snprintf(response,sizeof(response),
+            ">>> Ready to receive on account %d.\n%s",
+            index,
+            receive_prompt);
+        return send_text(req->conn_fd,response) == 0;
+    }else if(parse_transfer_command(line,&src,&dst,&amount)==true){
+        if(receiver_fd[dst] == -1){
+            snprintf(response,sizeof(response),
+            ">>> [Error] Receiver unavailable.\n%s"
+                ready_prompt);
+            return send_text(req->conn_fd,response) == 0;
+        }
+        int dst_fd = receiver_fd[dst];
+        int src_fd = req->conn_fd;
+        if((record_owner[src]!=-1
+            &&record_owner[src]!=src_fd)
+            ||set_record_lock(src,F_WRLCK)<0){
+            snprintf(response,sizeof(response),
+                ">>> Locked.\n%s", ready_prompt);
+            return send_text(req->conn_fd,response);
+        }
+        record_owner[src] = src_fd;
+        if((record_owner[dst]!=-1
+            &&record_owner[dst]!=src_fd)
+            ||set_record_lock(dst,F_WRLCK)<0){
+            snprintf(response,sizeof(response),
+                ">>> Locked.\n%s", ready_prompt);
+            record_owner[src] = -1;
+            if(set_record_lock(src,F_UNLCK)<0) return false;
+            return send_text(req->conn_fd,response);
+        }
+        record_owner[dst] = src_fd;
+        account_record src_record;
+        account_record dst_record;
+        if(read_record_at(src,&src_record)<0
+            ||read_record_at(dst,&dst_record)<0){
+            record_owner[src] = -1;
+            record_owner[dst] = -1;
+            set_record_lock(src,F_UNLCK);
+            set_record_lock(dst,F_UNLCK);
+            return false;
+        }
+        long long newsrcbalance = (long long)src_record.balance;
+        newsrcbalance-=amount;
+        long long newdstbalance = (long long)dst_record.balance;
+        newdstbalance += amount;
+        if(newsrcbalance<0||newdstbalance>1000000){
+            snprintf(response,sizeof(response),
+                ">>> [Error] Balance out of range.\n%s",
+                ready_prompt);
+            record_owner[src] = -1;
+            record_owner[dst] = -1;
+            set_record_lock(src,F_UNLCK);
+            set_record_lock(dst,F_UNLCK);
+            return send_text(req->conn_fd,response);
+        }
+        req->state = WAIT_TRANSFER_OUT;
+        req->account_index = src;
+        req->current_balance = src_record.balance;
+        snprintf(response,sizeof(response),
+            ">>> Transfer requested.\n%s",
+            transfer_prompt);
+        if(send_text(req->conn_fd,response)<0)return false;
+        req->state = WAIT_TRANSFER_OUT;
+        req->account_index = src;
+        req->target_index = dst;
+        req->amount = amount;
+        req->peer_fd = dst_fd;
+        requestP[dst_fd].state = WAIT_TRANSFER_IN;
+        requestP[dst_fd].peer_fd = src_fd;
+        int src_id = get_account_id_by_index(src);
+        int dst_id = get_account_id_by_index(dst);
+        snprintf(response, sizeof(response), 
+            ">>> Transfer offer: %d -> %d, amount: %d\n%s", 
+            src_id, dst_id, amount, accept_prompt);
+        return send_text(dst_fd,response) == 0;
+    }else{
+        snprintf(response,sizeof(response),
+            ">>> [Error] Invalid command.\n");
+        send_text(req->conn_fd,response);
+        return false;
+    }
     /* TODO 4: receive <id>, transfer <source> <target> <amount>.
      * Match a local receiver, check local owners, and try both F_WRLCK locks.
      * Any conflict: release acquired locks, reply Locked to the sender,
@@ -433,6 +529,29 @@ static bool handle_transfer_ready(request *req, const char *line) {
 }
 
 static bool handle_wait_transfer(request *req, const char *line) {
+    if(req->state == WAIT_RECEIVE){
+        if(strcmp(line,"cancel")==0){
+            receiver_fd[req->account_index]  = -1;
+            req->state = READY;
+            req->account_index = -1;
+            req->current_balance = 0;
+            snprintf(response,sizeof(response),
+                ">>> Receive canceled.\n%s",
+                ready_prompt);
+            return send_text(req->conn_fd,response) == 0;
+        }else if(){
+        }else{
+            receiver_fd[req->account_index]  = -1;
+            req->state = READY;
+            req->account_index = -1;
+            req->current_balance = 0;
+            snprintf(response, sizeof(response),    
+                ">>> [Error] Invalid command.\n");
+            send_text(req->conn_fd, response);
+            return false;
+        }
+        return true;
+    }
     /* TODO 4: Handle receive and transfer-confirmation states.
      * Only the matched receiver may accept/reject; only the sender cancels
      * a pending offer. Exit/invalid input use close_client() cleanup.

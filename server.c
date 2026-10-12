@@ -530,9 +530,11 @@ static void serve_clients(void) {
     while(1){
         close_failed_clients(&master_set);
         memcpy(&working_set,&master_set,sizeof(master_set));
-        select(max_nfds+1,&working_set,NULL,NULL,NULL);
+        peer_len = sizeof(peer);
+        if(select(max_nfds+1,&working_set,NULL,NULL,NULL)<0) continue;
         for(int i=0;i<=max_nfds;i++){
             if(FD_ISSET(i,&working_set)!=true) continue;
+            if(requestP[i].close_pending) continue;
             if(i == svr.listen_fd){
                 int fd = accept(svr.listen_fd, 
                     (struct sockaddr *)&peer, &peer_len);
@@ -551,18 +553,44 @@ static void serve_clients(void) {
                 if (send_text(fd, welcome_banner) < 0 ||
                     send_text(fd, ready_prompt) < 0) {
                     close_client(fd, &master_set);
+                    if(fd == max_nfds){
+                        for(int idx=max_nfds-1;idx>=0;idx--){
+                            if(FD_ISSET(idx,&master_set)==true){
+                                max_nfds = idx;
+                                break;
+                            }
+                        }
+                    }
                     continue;
                 }
             }else{
                 int status = append_input(&requestP[i]);
                 if (status == INPUT_EOF || status == INPUT_ERROR){
                     close_client(i, &master_set);
+                    if(i == max_nfds){
+                        for(int idx=max_nfds-1;idx>=0;idx--){
+                            if(FD_ISSET(idx,&master_set)==true){
+                                max_nfds = idx;
+                                break;
+                            }
+                        }
+                    }
                     continue;
                 }
                 if (status == INPUT_RETRY) continue;
                 else{
                     int res = drain_commands(requestP+i);
-                    if(res==false) close_client(i,&master_set);
+                    if(res==false){
+                        if(i == max_nfds){
+                            for(int idx=max_nfds-1;idx>=0;idx--){
+                                if(FD_ISSET(idx,&master_set)==true){
+                                    max_nfds = idx;
+                                    break;
+                                }
+                            }
+                        }
+                        close_client(i,&master_set);
+                    } 
                 }
             }
         }

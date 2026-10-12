@@ -321,7 +321,7 @@ static bool handle_ready(request *req, const char *line) {
         }
         req->state = WAIT_UPDATE;
         req->account_index = index;
-        req->current_balance = record.balance;
+//      req->current_balance = record.balance;
         snprintf(response,sizeof(response),
             ">>> Account %d balance: %d\n"
             ">>> Update lock acquired.\n%s",
@@ -419,6 +419,7 @@ static void cleanup_transfer(request *req) {
 }
 
 static bool handle_transfer_ready(request *req, const char *line) {
+    char response[MAX_MSG_LEN];
     int index;
     int src,dst,amount;
     if(parse_account_command(line,"receive",&index)){
@@ -434,7 +435,7 @@ static bool handle_transfer_ready(request *req, const char *line) {
         req->current_balance = record.balance;
         snprintf(response,sizeof(response),
             ">>> Ready to receive on account %d.\n%s",
-            index,
+            index+ACCOUNT_ID_START,
             receive_prompt);
         return send_text(req->conn_fd,response) == 0;
     }else if(parse_transfer_command(line,&src,&dst,&amount)==true){
@@ -502,8 +503,8 @@ static bool handle_transfer_ready(request *req, const char *line) {
         req->peer_fd = dst_fd;
         requestP[dst_fd].state = WAIT_TRANSFER_IN;
         requestP[dst_fd].peer_fd = src_fd;
-        int src_id = get_account_id_by_index(src);
-        int dst_id = get_account_id_by_index(dst);
+        int src_id = ACCOUNT_ID_START+src;
+        int dst_id = ACCOUNT_ID_START+dst;
         snprintf(response, sizeof(response), 
             ">>> Transfer offer: %d -> %d, amount: %d\n%s", 
             src_id, dst_id, amount, accept_prompt);

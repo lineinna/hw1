@@ -444,35 +444,43 @@ static void reset_transfer_fields(request *req)
     req->amount = 0;
 }
 static void cleanup_transfer(request *req) {
-    request *sender;
-    request *receiver;
-    int source;
-    int target;
-    int sender_fd;
+    request *sender = NULL;
+    request *receiver = NULL;
+    int source = -1;
+    int target = -1;
+    int sender_fd = -1;
 
     if (req->state == WAIT_TRANSFER_OUT) {
         sender = req;
-        if (req->peer_fd < 0 || req->peer_fd >= maxfd)
-            return;
-        receiver = &requestP[req->peer_fd];
+        source = sender->account_index;
+        target = sender->target_index;
+        sender_fd = sender->conn_fd;
+        if (req->peer_fd >= 0 && req->peer_fd < maxfd)
+            receiver = &requestP[req->peer_fd];
     } else if (req->state == WAIT_TRANSFER_IN) {
         receiver = req;
-        if (req->peer_fd < 0 || req->peer_fd >= maxfd)
+        if (req->peer_fd < 0 || req->peer_fd >= maxfd) {
+            reset_transfer_fields(receiver);
             return;
+        }
         sender = &requestP[req->peer_fd];
+        if (sender->state != WAIT_TRANSFER_OUT ||
+            sender->peer_fd != receiver->conn_fd ||
+            receiver->peer_fd != sender->conn_fd)
+            return;
+        source = sender->account_index;
+        target = sender->target_index;
+        sender_fd = sender->conn_fd;
     } else {
         return;
     }
 
-    if (sender->state != WAIT_TRANSFER_OUT ||
-        sender->peer_fd != receiver->conn_fd ||
-        receiver->peer_fd != sender->conn_fd) {
+    if (receiver != NULL &&
+        (sender->state != WAIT_TRANSFER_OUT ||
+         sender->peer_fd != receiver->conn_fd ||
+         receiver->peer_fd != sender->conn_fd)) {
         return;
     }
-
-    source = sender->account_index;
-    target = sender->target_index;
-    sender_fd = sender->conn_fd;
 
     if (source >= 0 && source < ACCOUNT_NUM &&
         record_owner[source] == sender_fd) {
@@ -492,13 +500,14 @@ static void cleanup_transfer(request *req) {
             record_owner[target] = -1;
         }
     }
-    if (target >= 0 && target < ACCOUNT_NUM &&
+    if (receiver != NULL && target >= 0 && target < ACCOUNT_NUM &&
         receiver_fd[target] == receiver->conn_fd) {
         receiver_fd[target] = -1;
     }
 
     reset_transfer_fields(sender);
-    reset_transfer_fields(receiver);
+    if (receiver != NULL)
+        reset_transfer_fields(receiver);
 }
 
 static bool handle_transfer_ready(request *req, const char *line) {
@@ -749,6 +758,15 @@ static bool handle_wait_transfer(request *req, const char *line) {
             }
             src_record.balance -= amount;
             dst_record.balance += amount;
+            if(src_record.balance < 0 || dst_record.balance > MAX_BALANCE){
+                snprintf(response,sizeof(response),
+                    ">>> [Error] Balance out of range.\n%s",
+                    ready_prompt);
+                int rs = send_text(req->conn_fd,response);
+                cleanup_transfer(req);
+                if(rs<0) return false;
+                return true;
+            }
             if(write_record_at(src,&src_record)<0
                 ||write_record_at(dst,&dst_record)<0){
                 cleanup_transfer(req);

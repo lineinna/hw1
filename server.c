@@ -139,6 +139,8 @@ static void release_update(request *req) {
 
 static void close_client(int fd, fd_set *master) {
     request *req = &requestP[fd];
+    int peer_fd = -1;
+    bool notify_peer = false;
     if (req->state == WAIT_RECEIVE &&
         req->account_index >= 0 && req->account_index < ACCOUNT_NUM &&
         receiver_fd[req->account_index] == fd) {
@@ -147,16 +149,19 @@ static void close_client(int fd, fd_set *master) {
     if ((req->state == WAIT_TRANSFER_OUT ||
          req->state == WAIT_TRANSFER_IN) &&
         req->peer_fd >= 0 && req->peer_fd < maxfd) {
-        request *peer = &requestP[req->peer_fd];
-        if (peer->conn_fd >= 0) {
-            if (send_text(peer->conn_fd,
-                          ">>> Transfer canceled: peer disconnected.\n"
-                          "Please enter your command: ") < 0) {
-                peer->close_pending = true;
-            }
-        }
+        peer_fd = req->peer_fd;
+        notify_peer = requestP[peer_fd].conn_fd >= 0 &&
+                      !requestP[peer_fd].close_pending;
     }
     cleanup_transfer(&requestP[fd]);
+    if (notify_peer) {
+        request *peer = &requestP[peer_fd];
+        if (send_text(peer->conn_fd,
+                      ">>> Transfer canceled: peer disconnected.\n"
+                      "Please enter your command: ") < 0) {
+            peer->close_pending = true;
+        }
+    }
     release_update(&requestP[fd]);
     if(master!=NULL) FD_CLR(fd,master);
     /*
@@ -471,13 +476,21 @@ static void cleanup_transfer(request *req) {
 
     if (source >= 0 && source < ACCOUNT_NUM &&
         record_owner[source] == sender_fd) {
-        set_record_lock(source, F_UNLCK);
-        record_owner[source] = -1;
+        if (set_record_lock(source, F_UNLCK) < 0) {
+            fprintf(stderr, "failed to unlock source record %d: %s\n",
+                    source, strerror(errno));
+        } else {
+            record_owner[source] = -1;
+        }
     }
     if (target >= 0 && target < ACCOUNT_NUM &&
         record_owner[target] == sender_fd) {
-        set_record_lock(target, F_UNLCK);
-        record_owner[target] = -1;
+        if (set_record_lock(target, F_UNLCK) < 0) {
+            fprintf(stderr, "failed to unlock target record %d: %s\n",
+                    target, strerror(errno));
+        } else {
+            record_owner[target] = -1;
+        }
     }
     if (target >= 0 && target < ACCOUNT_NUM &&
         receiver_fd[target] == receiver->conn_fd) {
@@ -601,15 +614,15 @@ static bool handle_transfer_ready(request *req, const char *line) {
         int src_id = ACCOUNT_ID_START+src;
         int dst_id = ACCOUNT_ID_START+dst;
         if(send_text(req->conn_fd,response)<0){
-            cleanup_transfer(req);
             return false;
         }
         snprintf(response, sizeof(response), 
             ">>> Transfer offer: %d -> %d, amount: %d\n%s", 
             src_id, dst_id, amount, accept_prompt);
         if(send_text(dst_fd,response)<0){
+            requestP[dst_fd].close_pending = true;
             cleanup_transfer(req);
-            return false;
+            return true;
         }
         return true;
     }else{
@@ -708,8 +721,7 @@ static bool handle_wait_transfer(request *req, const char *line) {
                 peer = &requestP[req->peer_fd];
             }
             snprintf(response,sizeof(response),
-                ">>> [Error] Invalid command.\n%s",
-                ready_prompt);
+                ">>> [Error] Invalid command.\n");
             send_text(req->conn_fd,response);
             if(peer!=NULL){
                 snprintf(response,sizeof(response),
@@ -803,8 +815,7 @@ static bool handle_wait_transfer(request *req, const char *line) {
                 peer = &requestP[req->peer_fd];
             }
             snprintf(response,sizeof(response),
-                ">>> [Error] Invalid command.\n%s",
-                ready_prompt);
+                ">>> [Error] Invalid command.\n");
             send_text(req->conn_fd,response);
             if(peer!=NULL){
                 snprintf(response,sizeof(response),

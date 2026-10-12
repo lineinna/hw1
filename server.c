@@ -140,12 +140,12 @@ static void release_update(request *req) {
 static void close_client(int fd, fd_set *master) {
     cleanup_transfer(&requestP[fd]);
     release_update(&requestP[fd]);
-
+    if(master!=NULL) FD_CLR(fd,master);
     /*
      * TODO 3: Remove fd from the monitored set when master is non-NULL.
      * The sequential development loop passes NULL.
      */
-    (void)master;
+//    (void)master;
 
     close(fd);
     init_request(&requestP[fd]);
@@ -457,19 +457,30 @@ static bool handle_command(request *req, const char *line) {
     return handle_wait_transfer(req, line);
 }
 
-
-
-
-
-static bool drain_commands(request *req) {
+static bool drain_commands(request *req){
+    bool keep = true;
+    int fd = req->conn_fd;
+    while (keep) {
+        char line[MAX_MSG_LEN];
+        int popped = pop_command(&requestP[fd], line, sizeof(line));
+        if (popped == 0) {
+            return true;
+        }
+        if (popped < 0) {
+            (void)send_text(fd, ">>> [Error] Invalid command.\n");
+            return false;
+        }
+        keep = handle_command(&requestP[fd], line);
+    }
+    return false;
+}
     /* TODO 3: dispatch ALL complete lines in order and preserve a partial tail.
      * Stop and discard remaining input when a handler requests disconnection.
      * add remains WAIT_UPDATE; close returns READY, so later lines in the
      * same batch must be interpreted using the resulting state.
      */
-    (void)req; (void)handle_command;
-    return true;
-}
+//  (void)req; (void)handle_command;
+//  return true;
 
 static void init_server(unsigned short port) {
     struct sockaddr_in addr;
@@ -510,6 +521,52 @@ static void init_server(unsigned short port) {
 
 
 static void serve_clients(void) {
+    fd_set master_set,working_set;
+    int max_nfds = svr.listen_fd;
+    FD_ZERO(&master_set);
+    FD_SET(svr.listen_fd,&master_set);
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    while(1){
+        close_failed_clients(&master_set);
+        memcpy(&working_set,&master_set,sizeof(master_set));
+        select(max_nfds+1,&working_set,NULL,NULL,NULL);
+        for(int i=0;i<=max_nfds;i++){
+            if(FD_ISSET(i,&working_set)!=true) continue;
+            if(i == svr.listen_fd){
+                int fd = accept(svr.listen_fd, 
+                    (struct sockaddr *)&peer, &peer_len);
+                if (fd < 0) {
+                    if (errno == EINTR) continue;
+                    ERR_EXIT("accept");
+                }
+                if (fd >= maxfd) {
+                    close(fd);
+                    continue;
+                }
+                FD_SET(fd,&master_set);
+                if(fd>max_nfds) max_nfds = fd;
+                init_request(&requestP[fd]);
+                requestP[fd].conn_fd = fd;
+                if (send_text(fd, welcome_banner) < 0 ||
+                    send_text(fd, ready_prompt) < 0) {
+                    close_client(fd, &master_set);
+                    continue;
+                }
+            }else{
+                int status = append_input(&requestP[i]);
+                if (status == INPUT_EOF || status == INPUT_ERROR){
+                    close_client(i, &master_set);
+                    continue;
+                }
+                if (status == INPUT_RETRY) continue;
+                else{
+                    int res = drain_commands(requestP+i);
+                    if(res==false) close_client(i,&master_set);
+                }
+            }
+        }
+    }
     (void)drain_commands; /* Used by the TODO 3 event loop. */
     /*
      * TODO 3: Replace this one-client-at-a-time loop with select().
@@ -521,56 +578,6 @@ static void serve_clients(void) {
      * Implement this loop for Tasks 3 and 4. Transfer lock conflicts return
      * Locked immediately; no waiting states or automatic retries exist.
      */
-    while (1) {
-        close_failed_clients(NULL);
-        struct sockaddr_in peer;
-        socklen_t peer_len = sizeof(peer);
-        int fd = accept(svr.listen_fd, (struct sockaddr *)&peer, &peer_len);
-        if (fd < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            ERR_EXIT("accept");
-        }
-        if (fd >= maxfd) {
-            close(fd);
-            continue;
-        }
-
-        init_request(&requestP[fd]);
-        requestP[fd].conn_fd = fd;
-        if (send_text(fd, welcome_banner) < 0 ||
-            send_text(fd, ready_prompt) < 0) {
-            close_client(fd, NULL);
-            continue;
-        }
-
-        bool keep = true;
-        while (keep) {
-            int status = append_input(&requestP[fd]);
-            if (status == INPUT_EOF || status == INPUT_ERROR) {
-                break;
-            }
-            if (status == INPUT_RETRY) {
-                continue;
-            }
-
-            while (keep) {
-                char line[MAX_MSG_LEN];
-                int popped = pop_command(&requestP[fd], line, sizeof(line));
-                if (popped == 0) {
-                    break;
-                }
-                if (popped < 0) {
-                    (void)send_text(fd, ">>> [Error] Invalid command.\n");
-                    keep = false;
-                    break;
-                }
-                keep = handle_command(&requestP[fd], line);
-            }
-        }
-        close_client(fd, NULL);
-    }
 }
 
 int main(int argc, char **argv) {

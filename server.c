@@ -308,7 +308,7 @@ static bool handle_ready(request *req, const char *line) {
         if(result<0){
             if(errno==EAGAIN||errno==EACCES){
                 snprintf(response,sizeof(response),
-                    ">>> Locked\n%s",ready_prompt);
+                    ">>> Locked.\n%s",ready_prompt);
                 return send_text(req->conn_fd,response) == 0;
             }
             else return false;

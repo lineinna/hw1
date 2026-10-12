@@ -138,6 +138,24 @@ static void release_update(request *req) {
 }
 
 static void close_client(int fd, fd_set *master) {
+    request *req = &requestP[fd];
+    if (req->state == WAIT_RECEIVE &&
+        req->account_index >= 0 && req->account_index < ACCOUNT_NUM &&
+        receiver_fd[req->account_index] == fd) {
+        receiver_fd[req->account_index] = -1;
+    }
+    if ((req->state == WAIT_TRANSFER_OUT ||
+         req->state == WAIT_TRANSFER_IN) &&
+        req->peer_fd >= 0 && req->peer_fd < maxfd) {
+        request *peer = &requestP[req->peer_fd];
+        if (peer->conn_fd >= 0) {
+            if (send_text(peer->conn_fd,
+                          ">>> Transfer canceled: peer disconnected.\n"
+                          "Please enter your command: ") < 0) {
+                peer->close_pending = true;
+            }
+        }
+    }
     cleanup_transfer(&requestP[fd]);
     release_update(&requestP[fd]);
     if(master!=NULL) FD_CLR(fd,master);
@@ -410,12 +428,64 @@ static bool handle_wait_update(request *req, const char *line) {
  * Set peer.close_pending if a peer notification fails; do not close a peer
  * inside a command handler. The supplied sweep handles those failures.
  */
+static void reset_transfer_fields(request *req)
+{
+    req->state = READY;
+    req->account_index = -1;
+    req->current_balance = 0;
+    req->peer_fd = -1;
+    req->target_index = -1;
+    req->target_balance = 0;
+    req->amount = 0;
+}
 static void cleanup_transfer(request *req) {
-    /* TODO 4: Remove registration, release only this transfer's locks,
-     * reset both participants and notify the surviving peer on disconnect.
-     * No-op for READY/WAIT_UPDATE. Never commit during cleanup.
-     */
-    (void)req;
+    request *sender;
+    request *receiver;
+    int source;
+    int target;
+    int sender_fd;
+
+    if (req->state == WAIT_TRANSFER_OUT) {
+        sender = req;
+        if (req->peer_fd < 0 || req->peer_fd >= maxfd)
+            return;
+        receiver = &requestP[req->peer_fd];
+    } else if (req->state == WAIT_TRANSFER_IN) {
+        receiver = req;
+        if (req->peer_fd < 0 || req->peer_fd >= maxfd)
+            return;
+        sender = &requestP[req->peer_fd];
+    } else {
+        return;
+    }
+
+    if (sender->state != WAIT_TRANSFER_OUT ||
+        sender->peer_fd != receiver->conn_fd ||
+        receiver->peer_fd != sender->conn_fd) {
+        return;
+    }
+
+    source = sender->account_index;
+    target = sender->target_index;
+    sender_fd = sender->conn_fd;
+
+    if (source >= 0 && source < ACCOUNT_NUM &&
+        record_owner[source] == sender_fd) {
+        set_record_lock(source, F_UNLCK);
+        record_owner[source] = -1;
+    }
+    if (target >= 0 && target < ACCOUNT_NUM &&
+        record_owner[target] == sender_fd) {
+        set_record_lock(target, F_UNLCK);
+        record_owner[target] = -1;
+    }
+    if (target >= 0 && target < ACCOUNT_NUM &&
+        receiver_fd[target] == receiver->conn_fd) {
+        receiver_fd[target] = -1;
+    }
+
+    reset_transfer_fields(sender);
+    reset_transfer_fields(receiver);
 }
 
 static bool handle_transfer_ready(request *req, const char *line) {
@@ -594,6 +664,158 @@ static bool handle_wait_transfer(request *req, const char *line) {
             return false;
         }
         return true;
+    }
+    if(req->state == WAIT_TRANSFER_OUT){
+        if(strcmp(line,"cancel")==0){
+            request *peer = NULL;
+            if(req->peer_fd >= 0 && req->peer_fd < maxfd){
+                peer = &requestP[req->peer_fd];
+            }
+            snprintf(response,sizeof(response),
+                ">>> Transfer canceled.\n%s",
+                ready_prompt);
+            int rs = send_text(req->conn_fd,response);
+            if(peer!=NULL){
+                snprintf(response,sizeof(response),
+                    ">>> Transfer canceled.\n%s",
+                    ready_prompt);
+                int ps = send_text(peer->conn_fd,response);
+                if(ps<0) peer->close_pending = true;
+            }
+            cleanup_transfer(req);
+            if(rs<0) return false;
+            return true;
+        }else if(strcmp(line,"exit")==0){
+            request *peer = NULL;
+            if(req->peer_fd >= 0 && req->peer_fd < maxfd){
+                peer = &requestP[req->peer_fd];
+            }
+            snprintf(response,sizeof(response),
+                ">>> Client exit.\n");
+            send_text(req->conn_fd,response);
+            if(peer!=NULL){
+                snprintf(response,sizeof(response),
+                    ">>> Transfer canceled: peer disconnected.\n%s",
+                    ready_prompt);
+                int ps = send_text(peer->conn_fd,response);
+                if(ps<0) peer->close_pending = true;
+            }
+            cleanup_transfer(req);
+            return false;
+        }else{
+            request *peer = NULL;
+            if(req->peer_fd >= 0 && req->peer_fd < maxfd){
+                peer = &requestP[req->peer_fd];
+            }
+            snprintf(response,sizeof(response),
+                ">>> [Error] Invalid command.\n%s",
+                ready_prompt);
+            send_text(req->conn_fd,response);
+            if(peer!=NULL){
+                snprintf(response,sizeof(response),
+                    ">>> Transfer canceled: peer disconnected.\n%s",
+                    ready_prompt);
+                int ps = send_text(peer->conn_fd,response);
+                if(ps<0) peer->close_pending = true;
+            }
+            cleanup_transfer(req);
+            return false;
+        }
+    }
+    if(req->state == WAIT_TRANSFER_IN){
+        if(strcmp(line,"accept")==0){
+            request *sender = &requestP[req->peer_fd];
+            int src = sender->account_index;
+            int dst = sender->target_index;
+            int amount = sender->amount;
+            account_record src_record;
+            account_record dst_record;
+            if(read_record_at(src,&src_record)<0
+                ||read_record_at(dst,&dst_record)<0){
+                cleanup_transfer(req);
+                return false;
+            }
+            src_record.balance -= amount;
+            dst_record.balance += amount;
+            if(write_record_at(src,&src_record)<0
+                ||write_record_at(dst,&dst_record)<0){
+                cleanup_transfer(req);
+                return false;
+            }
+            request *peer = NULL;
+            if(req->peer_fd >= 0 && req->peer_fd < maxfd){
+                peer = &requestP[req->peer_fd];
+            }
+            snprintf(response,sizeof(response),
+                ">>> Transfer completed.\n"
+                ">>> Account %d balance: %d\n"
+                ">>> Account %d balance: %d\n%s",
+                ACCOUNT_ID_START + src, src_record.balance,
+                ACCOUNT_ID_START + dst, dst_record.balance,
+                ready_prompt);
+            int rs = send_text(req->conn_fd,response);
+            if(peer!=NULL){
+                int ps = send_text(peer->conn_fd,response);
+                if(ps<0) peer->close_pending = true;
+            }
+            cleanup_transfer(req);
+            if(rs<0) return false;
+            return true;
+        }else if(strcmp(line,"reject")==0){
+            request *peer = NULL;
+            if(req->peer_fd >= 0 && req->peer_fd < maxfd){
+                peer = &requestP[req->peer_fd];
+            }
+            snprintf(response,sizeof(response),
+                ">>> Transfer rejected.\n%s",
+                ready_prompt);
+            int rs = send_text(req->conn_fd,response);
+            if(peer!=NULL){
+                snprintf(response,sizeof(response),
+                    ">>> Transfer rejected.\n%s",
+                    ready_prompt);
+                int ps = send_text(peer->conn_fd,response);
+                if(ps<0) peer->close_pending = true;
+            }
+            cleanup_transfer(req);
+            if(rs<0) return false;
+            return true;
+        }else if(strcmp(line,"exit")==0){
+            request *peer = NULL;
+            if(req->peer_fd >= 0 && req->peer_fd < maxfd){
+                peer = &requestP[req->peer_fd];
+            }
+            snprintf(response,sizeof(response),
+                ">>> Client exit.\n");
+            send_text(req->conn_fd,response);
+            if(peer!=NULL){
+                snprintf(response,sizeof(response),
+                    ">>> Transfer canceled: peer disconnected.\n%s",
+                    ready_prompt);
+                int ps = send_text(peer->conn_fd,response);
+                if(ps<0) peer->close_pending = true;
+            }
+            cleanup_transfer(req);
+            return false;
+        }else{
+            request *peer = NULL;
+            if(req->peer_fd >= 0 && req->peer_fd < maxfd){
+                peer = &requestP[req->peer_fd];
+            }
+            snprintf(response,sizeof(response),
+                ">>> [Error] Invalid command.\n%s",
+                ready_prompt);
+            send_text(req->conn_fd,response);
+            if(peer!=NULL){
+                snprintf(response,sizeof(response),
+                    ">>> Transfer canceled: peer disconnected.\n%s",
+                    ready_prompt);
+                int ps = send_text(peer->conn_fd,response);
+                if(ps<0) peer->close_pending = true;
+            }
+            cleanup_transfer(req);
+            return false;
+        }
     }
     /* TODO 4: Handle receive and transfer-confirmation states.
      * Only the matched receiver may accept/reject; only the sender cancels

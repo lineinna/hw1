@@ -574,7 +574,15 @@ static bool handle_wait_transfer(request *req, const char *line) {
                 ">>> Receive canceled.\n%s",
                 ready_prompt);
             return send_text(req->conn_fd,response) == 0;
-        }else if(){
+        }else if(strcmp(line,"exit")==0){
+            receiver_fd[req->account_index]  = -1;
+            req->state = READY;
+            req->account_index = -1;
+            req->current_balance = 0;
+            snprintf(response, sizeof(response),
+                ">>> Client exit.\n");
+            send_text(req->conn_fd,response);
+            return false;
         }else{
             receiver_fd[req->account_index]  = -1;
             req->state = READY;
